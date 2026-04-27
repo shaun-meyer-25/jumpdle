@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Jumpdle</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; background: #04060c; display: flex; align-items: center; justify-content: center; overflow: hidden; user-select: none; }
@@ -76,7 +77,7 @@ function loadSession() {
 // ── Physics constants ─────────────────────────────────────────────
 const GRAV     = 0.56;
 const JUMP     = -13.2;
-const JUMP_CUT = -8.0;  // vy ceiling on space release (short hop)
+const JUMP_CUT = -9.3;  // vy ceiling on space release (short hop ≈ half full-hop height)
 const SPD0     = 2.85;  // starting speed (px/frame)
 const SPDMAX  = 10.5;   // max speed
 const ACCEL   = 0.0018; // speed increase per frame
@@ -549,26 +550,26 @@ function drawPlayer() {
   const p  = G.p;
   const px = Math.round(p.x / PS) * PS;
   const py = Math.round(p.y / PS) * PS;
-  const fi = !p.onGround ? 2 : Math.floor(p.x / 14) % 2;
+  const fi = !p.onGround ? 2 : Math.abs(Math.floor(p.x / 14)) % 2;
   drawSprite(fi, px, py);
 }
 
 // ── HUD ───────────────────────────────────────────────────────────
 function drawHUD() {
-  ctx.font      = '13px "Courier New", monospace';
+  ctx.font      = '8px "Press Start 2P", monospace';
   ctx.textAlign = 'left';
 
   ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  ctx.fillRect(10, 10, 138, 30);
+  ctx.fillRect(10, 10, 152, 30);
   ctx.fillStyle = '#e2e8f0';
-  ctx.fillText(`Lives lost: ${G.deaths}`, 20, 30);
+  ctx.fillText(`Lives lost: ${G.deaths}`, 16, 29);
 
   if (G.p) {
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(W - 148, 10, 138, 30);
+    ctx.fillRect(W - 162, 10, 152, 30);
     ctx.textAlign = 'right';
     ctx.fillStyle = '#64748b';
-    ctx.fillText(`speed ${G.p.spd.toFixed(1)}x`, W - 20, 30);
+    ctx.fillText(`speed ${G.p.spd.toFixed(1)}x`, W - 16, 29);
     ctx.textAlign = 'left';
   }
 }
@@ -577,23 +578,23 @@ function drawHUD() {
 function drawMenu() {
   ctx.textAlign = 'center';
 
-  ctx.font      = 'bold 58px "Courier New", monospace';
+  ctx.font      = '40px "Press Start 2P", monospace';
   ctx.fillStyle = '#FFE860';
-  ctx.fillText('JUMPDLE', W / 2, H / 2 - 58);
+  ctx.fillText('JUMPDLE', W / 2, H / 2 - 52);
 
-  ctx.font      = '14px "Courier New", monospace';
-  ctx.fillStyle = '#475569';
-  ctx.fillText(`Day #${G.day}`, W / 2, H / 2 - 20);
+  ctx.font      = '10px "Press Start 2P", monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.76)';
+  ctx.fillText(`Day #${G.day}`, W / 2, H / 2 - 18);
 
   const isResume = G.lastCPIdx > 0 || G.deaths > 0;
-  ctx.font      = '21px "Courier New", monospace';
+  ctx.font      = '14px "Press Start 2P", monospace';
   ctx.fillStyle = '#e2e8f0';
   ctx.fillText(isResume ? 'PRESS SPACE TO CONTINUE' : 'PRESS SPACE TO RUN', W / 2, H / 2 + 22);
 
-  ctx.font      = '13px "Courier New", monospace';
+  ctx.font      = '8px "Press Start 2P", monospace';
   if (isResume) {
     ctx.fillStyle = '#475569';
-    ctx.fillText(`${G.deaths} lives lost · checkpoint ${G.lastCPIdx}`, W / 2, H / 2 + 46);
+    ctx.fillText(`${G.deaths} lives lost · checkpoint ${G.lastCPIdx}`, W / 2, H / 2 + 48);
   } else {
     ctx.fillStyle = '#2d3a4a';
     ctx.fillText('reach the finish · as few lives lost as possible', W / 2, H / 2 + 58);
@@ -609,16 +610,16 @@ function drawDyingScreen() {
 
   ctx.textAlign = 'center';
 
-  ctx.font      = `bold 40px "Courier New", monospace`;
+  ctx.font      = '24px "Press Start 2P", monospace';
   ctx.fillStyle = `rgba(239,68,68,${t})`;
   ctx.fillText('DEAD', W / 2, H / 2 - 16);
 
-  ctx.font      = '16px "Courier New", monospace';
+  ctx.font      = '12px "Press Start 2P", monospace';
   ctx.fillStyle = `rgba(226,232,240,${t})`;
   ctx.fillText(`Lives lost: ${G.deaths}`, W / 2, H / 2 + 16);
 
   if (G.dyingTimer <= 0) {
-    ctx.font      = '15px "Courier New", monospace';
+    ctx.font      = '12px "Press Start 2P", monospace';
     ctx.fillStyle = '#e2e8f0';
     ctx.fillText('PRESS SPACE TO CONTINUE', W / 2, H / 2 + 50);
   }
@@ -634,7 +635,7 @@ function drawEndScreen() {
 
   ctx.textAlign = 'center';
 
-  ctx.font      = `bold 40px "Courier New", monospace`;
+  ctx.font      = '24px "Press Start 2P", monospace';
   ctx.fillStyle = `rgba(241,245,249,${t})`;
   ctx.fillText('FINISHED!', W / 2, H / 2 - 78);
 
@@ -645,11 +646,11 @@ function drawEndScreen() {
               : G.deaths <= 2  ? '250,204,21'
               : '226,232,240';
 
-  ctx.font      = `bold 26px "Courier New", monospace`;
+  ctx.font      = '16px "Press Start 2P", monospace';
   ctx.fillStyle = `rgba(${rgb},${t})`;
   ctx.fillText(label, W / 2, H / 2 - 34);
 
-  ctx.font      = '14px "Courier New", monospace';
+  ctx.font      = '10px "Press Start 2P", monospace';
   ctx.fillStyle = `rgba(100,116,139,${t})`;
   ctx.fillText(`Max speed: ${G.maxSpd.toFixed(1)}x  ·  Day #${G.day}`, W / 2, H / 2 + 8);
 
@@ -658,9 +659,9 @@ function drawEndScreen() {
     ctx.fillStyle = '#1d4ed8';
     roundRect(W / 2 - 100, H / 2 + 36, 200, 42, 7);
     ctx.fill();
-    ctx.font      = '17px "Courier New", monospace';
+    ctx.font      = '12px "Press Start 2P", monospace';
     ctx.fillStyle = '#ffffff';
-    ctx.fillText(G.copied > 0 ? '✓ Copied!' : 'Share Result', W / 2, H / 2 + 62);
+    ctx.fillText(G.copied > 0 ? 'COPIED!' : 'Share Result', W / 2, H / 2 + 62);
   }
 }
 
