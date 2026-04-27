@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jumpdle</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #04060c; display: flex; align-items: center; justify-content: center; overflow: hidden; user-select: none; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ── Canvas & resize ───────────────────────────────────────────────
+const W = 800, H = 450;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = W; canvas.height = H;
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width  = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+// ── Seeded RNG (xorshift32) ───────────────────────────────────────
+function makeRNG(seed) {
+  let s = (seed ^ 0xDEADBEEF) >>> 0 || 1;
+  return {
+    f()          { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0) / 4294967296; },
+    range(a, b)  { return a + this.f() * (b - a); },
+    int(a, b)    { return a + Math.floor(this.f() * (b - a + 1)); },
+  };
+}
+
+function dateSeed() {
+  const d = new Date();
+  const str = `${d.getFullYear()}${d.getMonth() + 1}${d.getDate()}`;
+  return str.split('').reduce((h, c) => (Math.imul(31, h) + c.charCodeAt(0)) | 0, 0) >>> 0;
+}
+
+function dayNumber() {
+  return Math.max(1, Math.floor((Date.now() - new Date(2026, 0, 1)) / 86400000) + 1);
+}
+
+// ── Session persistence ───────────────────────────────────────────
+const SAVE_KEY = 'jumpdle_session';
+
+function saveSession(completed = false) {
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      seed:       G.seed,
+      day:        G.day,
+      deaths:     G.deaths,
+      lastCPIdx:  G.lastCPIdx,
+      visitedCPs: Array.from(G.visitedCPs),
+      maxSpd:     G.maxSpd,
+      completed,
+    }));
+  } catch (_) {}
+}
+
+function loadSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null');
+    return (s && !s.completed) ? s : null;
+  } catch (_) { return null; }
+}
+
+// ── Physics constants ─────────────────────────────────────────────
+const GRAV     = 0.56;
+const JUMP     = -13.2;
+const JUMP_CUT = -8.0;  // vy ceiling on space release (short hop)
+const SPD0     = 2.85;  // starting speed (px/frame)
+const SPDMAX  = 10.5;   // max speed
+const ACCEL   = 0.0018; // speed increase per frame
+const PW = 16, PH = 34; // player bounding box
+
+// ── Level generation constants ────────────────────────────────────
+const BASE_Y    = 300;  // default platform top Y
+const N_PLATS   = 28;
+const CP_EVERY  = 4;    // checkpoint every N platforms
+const P_MIN_W   = 140, P_MAX_W = 300;
+const GAP_MIN   = 55,  GAP_MAX = 108;  // kept jumpable at SPD0
+const DY_RANGE  = 52;   // max height delta between platforms
+const WALL_W    = 14,  WALL_H = 42;
+
+// ── NES palette & pixel art ───────────────────────────────────────
+const PS = 4; // canvas pixels per sprite pixel
+
+const PAL = {
+  skyA:      '#162080',  skyB:      '#2858C8',
+  bgTrunk:   '#4A2E08',  bgLeaf:    '#1A8A1A',  bgTree: '#0A5A0A',
+  bgRuin:    '#3A2810',
+  waterTop:  '#2050D8',  waterMid:  '#1438A8',  waterShim: '#5878F8',
+  crocBody:  '#1A6A0A',  crocEye:   '#FF2000',  crocTooth: '#E8E8B0',
+  platTop:   '#50C030',  platBody:  '#7A5018',  platShad:  '#503210',
+  boulder:   ['#A8A8A8', '#686868', '#383838', '#D0D0D0'],
+  torchPole: '#8B6410',  torchFire: ['#FF8000', '#FFD000', '#FF3000'],
+  temple:    ['#C0A050', '#806820', '#100808'],
+};
+
+// Indiana Jones sprite — 4 wide × 8 tall native pixels
+const INDY_C = [null, '#7B4F1E', '#F0B868', '#C07828', '#503010', '#A09060', '#402810'];
+const INDY_F = [
+  // Run A – left foot forward
+  [[0,1,1,0],[1,1,1,1],[0,2,2,0],[3,3,3,3],[3,3,3,3],[4,3,3,4],[5,5,4,0],[6,6,5,0]],
+  // Run B – right foot forward
+  [[0,1,1,0],[1,1,1,1],[0,2,2,0],[3,3,3,3],[3,3,3,3],[4,3,3,4],[0,4,5,5],[0,5,6,6]],
+  // Air – legs tucked
+  [[0,1,1,0],[1,1,1,1],[0,2,2,0],[3,3,3,3],[3,3,3,3],[4,3,3,4],[5,4,4,5],[6,0,0,6]],
+];
+
+function drawSprite(fi, x, y) {
+  const f = INDY_F[fi];
+  for (let r = 0; r < f.length; r++)
+    for (let c = 0; c < f[r].length; c++) {
+      if (!f[r][c]) continue;
+      ctx.fillStyle = INDY_C[f[r][c]];
+      ctx.fillRect(x + c * PS, y + r * PS, PS, PS);
+    }
+}
+
+// ── Level generation ──────────────────────────────────────────────
+function generateLevel(seed) {
+  const rng = makeRNG(seed);
+  const plats = [];
+  let y = BASE_Y;
+
+  for (let i = 0; i < N_PLATS; i++) {
+    const isFirst = i === 0;
+    const isLast  = i === N_PLATS - 1;
+    const isCP    = !isFirst && !isLast && (i % CP_EVERY === 0);
+    const w       = isFirst ? 380 : rng.int(P_MIN_W, P_MAX_W);
+
+    let x;
+    if (isFirst) {
+      x = -180;
+    } else {
+      const prev = plats[plats.length - 1];
+      const gap  = rng.range(GAP_MIN, GAP_MAX);
+      x = prev.x + prev.w + gap;
+      const dy = rng.range(-DY_RANGE, DY_RANGE);
+      y = Math.max(210, Math.min(360, y + dy));
+    }
+
+    // Walls – only on non-special platforms wide enough to place them safely
+    const walls = [];
+    if (!isFirst && !isLast && !isCP && w >= 190 && rng.f() > 0.42) {
+      const margin = 80;
+      const wx = rng.range(margin, w - margin - WALL_W);
+      walls.push({ rx: wx });
+      if (w >= 260 && rng.f() > 0.58) {
+        const wx2 = rng.range(wx + WALL_W + 60, w - margin - WALL_W);
+        if (wx2 < w - margin - WALL_W) walls.push({ rx: wx2 });
+      }
+    }
+
+    plats.push({ x, y, w, walls, isCP, isLast, isFirst });
+  }
+  return plats;
+}
+
+// ── Game state ────────────────────────────────────────────────────
+let G;
+
+function newGame() {
+  const session = loadSession();
+  const seed    = session ? session.seed : dateSeed();
+  const day     = session ? session.day  : dayNumber();
+
+  G = {
+    phase:      'menu',
+    plats:      generateLevel(seed),
+    p:          null,
+    cam:        { x: 0, y: 0 },
+    deaths:     session ? session.deaths    : 0,
+    maxSpd:     session ? session.maxSpd    : 0,
+    lastCPIdx:  session ? session.lastCPIdx : 0,
+    visitedCPs: session ? new Set(session.visitedCPs) : new Set([0]),
+    dyingTimer: 0,
+    flash:      0,
+    endTimer:   0,
+    copied:     0,
+    frame:      0,
+    seed,
+    day,
+  };
+  spawnPlayer(G.lastCPIdx);
+}
+
+function spawnPlayer(platIdx) {
+  const pl = G.plats[platIdx];
+  G.p = {
+    x: pl.x + 20,
+    y: pl.y - PH,
+    vy: 0,
+    spd: SPD0,
+    onGround: true,
+    prevOnGround: true,
+  };
+  // Snap camera to player
+  G.cam.x = G.p.x - W * 0.28;
+  G.cam.y = G.p.y - H * 0.52;
+}
+
+// ── Input ─────────────────────────────────────────────────────────
+let spaceDown = false;
+
+function onSpacePress() {
+  switch (G.phase) {
+    case 'menu':
+      G.phase = 'play';
+      break;
+    case 'dying':
+      if (G.dyingTimer <= 0) {
+        G.phase = 'play';
+        spawnPlayer(G.lastCPIdx);
+      }
+      break;
+    case 'play':
+      if (G.p.onGround) {
+        G.p.vy = JUMP;
+        G.p.onGround = false;
+      }
+      break;
+  }
+}
+
+addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (!spaceDown) { spaceDown = true; onSpacePress(); }
+  }
+});
+addEventListener('keyup', e => {
+  if (e.code === 'Space') {
+    spaceDown = false;
+    cutJump();
+  }
+});
+addEventListener('touchstart', e => {
+  e.preventDefault();
+  onSpacePress();
+}, { passive: false });
+addEventListener('touchend', e => {
+  e.preventDefault();
+  cutJump();
+}, { passive: false });
+
+function cutJump() {
+  if (G && G.phase === 'play' && G.p && G.p.vy < JUMP_CUT) {
+    G.p.vy = JUMP_CUT;
+  }
+}
+
+// ── Update ────────────────────────────────────────────────────────
+function update() {
+  G.flash = Math.max(0, G.flash - 1);
+  G.copied = Math.max(0, G.copied - 1);
+  G.frame++;
+
+  if (G.phase === 'dying') {
+    G.dyingTimer = Math.max(0, G.dyingTimer - 1);
+    return;
+  }
+
+  if (G.phase === 'end') {
+    G.endTimer++;
+    return;
+  }
+
+  if (G.phase !== 'play') return;
+
+  const p     = G.p;
+  const plats = G.plats;
+
+  // Accelerate
+  p.spd = Math.min(SPDMAX, p.spd + ACCEL);
+  G.maxSpd = Math.max(G.maxSpd, p.spd);
+
+  // Horizontal move
+  p.x += p.spd;
+
+  // Vertical move – save previous bottom for landing detection
+  const prevBottom    = p.y + PH;
+  p.prevOnGround      = p.onGround;
+  p.vy += GRAV;
+  p.y  += p.vy;
+  p.onGround = false;
+
+  const camLeft  = G.cam.x - 60;
+  const camRight = G.cam.x + W + 60;
+
+  for (let i = 0; i < plats.length; i++) {
+    const pl = plats[i];
+    if (pl.x + pl.w < camLeft || pl.x > camRight) continue;
+
+    const overlapH = p.x + PW > pl.x && p.x < pl.x + pl.w;
+
+    // ── Landing on platform top ──────────────────────────────────
+    // Valid landing: was already on ground (staying on platform) OR approached strictly from above
+    if (overlapH && p.vy >= 0 && prevBottom <= pl.y && p.y + PH >= pl.y &&
+        (p.prevOnGround || prevBottom < pl.y)) {
+      p.y        = pl.y - PH;
+      p.vy       = 0;
+      p.onGround = true;
+
+      // Checkpoint / end trigger
+      if (!G.visitedCPs.has(i) && (pl.isCP || pl.isLast)) {
+        G.visitedCPs.add(i);
+        G.lastCPIdx = i;
+        if (pl.isLast) {
+          G.phase    = 'end';
+          G.endTimer = 0;
+          saveSession(true);
+          return;
+        }
+        saveSession();
+      }
+    }
+
+    // ── Wall collisions ──────────────────────────────────────────
+    for (const wall of pl.walls) {
+      const wx  = pl.x  + wall.rx;
+      const wy  = pl.y  - WALL_H;
+      if (p.x + PW > wx && p.x < wx + WALL_W &&
+          p.y + PH > wy && p.y < pl.y) {
+        triggerDeath();
+        return;
+      }
+    }
+  }
+
+  // Death by falling below camera bottom
+  if (p.y > G.cam.y + H + 160) {
+    triggerDeath();
+    return;
+  }
+
+  // Camera lerp
+  const tx = p.x - W * 0.28;
+  const ty = p.y - H * 0.52;
+  G.cam.x += (tx - G.cam.x) * 0.12;
+  G.cam.y += (ty - G.cam.y) * 0.09;
+}
+
+function triggerDeath() {
+  G.deaths++;
+  G.phase      = 'dying';
+  G.dyingTimer = 22; // brief lockout so a mid-jump space doesn't instantly respawn
+  G.flash      = 20;
+  saveSession();
+}
+
+// ── Rendering ─────────────────────────────────────────────────────
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  // NES two-band sky
+  ctx.fillStyle = PAL.skyA;
+  ctx.fillRect(0, 0, W, Math.floor(H * 0.45));
+  ctx.fillStyle = PAL.skyB;
+  ctx.fillRect(0, Math.floor(H * 0.45), W, Math.ceil(H * 0.55));
+
+  if (G.phase === 'menu') { drawMenu(); return; }
+
+  // Parallax city silhouette (screen space, before world transform)
+  drawBg();
+
+  // World transform
+  ctx.save();
+  ctx.translate(-Math.round(G.cam.x / PS) * PS, -Math.round(G.cam.y / PS) * PS);
+  drawPlatforms();
+  if (G.phase === 'play' || G.phase === 'dying') drawPlayer();
+  ctx.restore();
+
+  // HUD (screen space)
+  drawHUD();
+
+  // Death flash
+  if (G.flash > 0) {
+    ctx.fillStyle = `rgba(220,30,30,${(G.flash / 20) * 0.42})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (G.phase === 'dying') drawDyingScreen();
+  if (G.phase === 'end')   drawEndScreen();
+}
+
+// ── Background + water ────────────────────────────────────────────
+const WATER_Y = H - 68; // screen Y of water surface
+
+function drawBg() {
+  // Pixel jungle trees (parallax 0.25x, snapped to 8px)
+  const scrl = Math.floor(G.cam.x * 0.25 / 8) * 8;
+  const per  = 200;
+  const base = Math.floor(scrl / per) * per - per;
+
+  for (let tx = base; tx <= scrl + W + per; tx += per) {
+    const sx = Math.round((tx - scrl) / PS) * PS;
+
+    // Canopy layers
+    ctx.fillStyle = PAL.bgLeaf;
+    ctx.fillRect(sx + 28, WATER_Y - 92, 24, 20);
+    ctx.fillRect(sx + 20, WATER_Y - 74, 40, 20);
+    ctx.fillRect(sx + 12, WATER_Y - 56, 56, 24);
+    ctx.fillStyle = PAL.bgTree;
+    ctx.fillRect(sx + 20, WATER_Y - 70, 28, 14);
+    ctx.fillRect(sx + 28, WATER_Y - 88, 16, 16);
+
+    // Trunk
+    ctx.fillStyle = PAL.bgTrunk;
+    ctx.fillRect(sx + 36, WATER_Y - 32, 8, 32);
+
+    // Stone ruin pillar (every other tree)
+    if (Math.floor(tx / per) % 2 === 0) {
+      ctx.fillStyle = PAL.bgRuin;
+      ctx.fillRect(sx + 128, WATER_Y - 48, 12, 48);
+      ctx.fillRect(sx + 124, WATER_Y - 52, 20, 8);
+      ctx.fillRect(sx + 126, WATER_Y - 60, 8, 8);
+    }
+  }
+
+  // Water surface (animated shimmer)
+  const wf = Math.floor(G.frame / 18) % 2;
+  ctx.fillStyle = PAL.waterMid;
+  ctx.fillRect(0, WATER_Y + 8, W, H - WATER_Y);
+  ctx.fillStyle = PAL.waterTop;
+  ctx.fillRect(0, WATER_Y, W, 8);
+  ctx.fillStyle = PAL.waterShim;
+  for (let wx = wf * 16; wx < W; wx += 32) ctx.fillRect(wx, WATER_Y, 16, 4);
+
+  // Crocodiles (half-speed parallax)
+  const cScrl = G.cam.x * 0.5;
+  const cPer  = 230;
+  const cBase = Math.floor(cScrl / cPer) * cPer - cPer;
+  for (let cx = cBase; cx <= cScrl + W + cPer; cx += cPer) {
+    const csx = Math.round((cx - cScrl) / PS) * PS;
+    const bob = Math.floor(G.frame / 28) % 2 * PS;
+    drawCroc(csx + 32, WATER_Y + 4 + bob);
+  }
+}
+
+function drawCroc(x, y) {
+  const d = [[0,1,1,1,1,0],[1,1,2,1,1,1],[1,1,1,1,1,0],[3,3,3,3,3,0]];
+  const c = [null, PAL.crocBody, PAL.crocEye, PAL.crocTooth];
+  for (let r = 0; r < d.length; r++)
+    for (let col = 0; col < d[r].length; col++) {
+      if (!d[r][col]) continue;
+      ctx.fillStyle = c[d[r][col]];
+      ctx.fillRect(x + col * PS, y + r * PS, PS, PS);
+    }
+}
+
+// ── Platforms ─────────────────────────────────────────────────────
+function drawPlatforms() {
+  const camL = G.cam.x - 60, camR = G.cam.x + W + 60;
+
+  for (let i = 0; i < G.plats.length; i++) {
+    const pl = G.plats[i];
+    if (pl.x + pl.w < camL || pl.x > camR) continue;
+
+    // Stone body
+    ctx.fillStyle = PAL.platBody;
+    ctx.fillRect(pl.x, pl.y, pl.w, 300);
+
+    // Stone course lines
+    ctx.fillStyle = PAL.platShad;
+    for (let sy = pl.y + 12; sy < pl.y + 72; sy += 12) ctx.fillRect(pl.x, sy, pl.w, 2);
+
+    // Moss/grass top strip
+    ctx.fillStyle = pl.isCP ? '#40D040' : pl.isLast ? '#60F060' : PAL.platTop;
+    ctx.fillRect(pl.x, pl.y, pl.w, PS);
+
+    // Checkpoint torch
+    if (pl.isCP) drawTorch(pl.x + 28, pl.y, G.visitedCPs.has(i));
+
+    // Finish temple
+    if (pl.isLast) drawTemple(pl.x + 44, pl.y);
+
+    // Boulder obstacles
+    for (const wall of pl.walls) drawBoulder(pl.x + wall.rx, pl.y - WALL_H);
+  }
+}
+
+function drawTorch(x, y, lit) {
+  const tx = Math.round(x / PS) * PS;
+  ctx.fillStyle = PAL.torchPole;
+  ctx.fillRect(tx, y - 20, PS, 20);
+  ctx.fillRect(tx - PS, y - 20, PS * 3, PS);
+  if (lit) {
+    const t = Math.floor(G.frame / 6) % 3;
+    ctx.fillStyle = PAL.torchFire[0];
+    ctx.fillRect(tx - PS, y - 32, PS * 3, PS * 3);
+    ctx.fillStyle = PAL.torchFire[1];
+    ctx.fillRect(tx - (t === 0 ? 0 : PS), y - 36, PS * 2, PS * 2);
+    ctx.fillStyle = PAL.torchFire[2];
+    ctx.fillRect(tx + (t === 1 ? PS : 0), y - 40, PS, PS);
+  } else {
+    ctx.fillStyle = '#505050';
+    ctx.fillRect(tx - PS / 2, y - 30, PS * 2, PS * 2);
+  }
+}
+
+function drawBoulder(x, y) {
+  const bx = Math.round(x / PS) * PS;
+  const by = Math.round(y / PS) * PS;
+  ctx.fillStyle = PAL.boulder[0];
+  ctx.fillRect(bx + PS, by, WALL_W - PS * 2, WALL_H);
+  ctx.fillRect(bx, by + PS, WALL_W, WALL_H - PS * 2);
+  ctx.fillStyle = PAL.boulder[2];
+  ctx.fillRect(bx + WALL_W - PS * 2, by + PS, PS * 2, WALL_H - PS * 2);
+  ctx.fillRect(bx + PS, by + WALL_H - PS * 2, WALL_W - PS * 2, PS * 2);
+  ctx.fillStyle = PAL.boulder[3];
+  ctx.fillRect(bx + PS, by + PS, PS, PS * 3);
+  ctx.fillRect(bx + PS * 2, by + PS, PS * 2, PS);
+  ctx.fillStyle = PAL.boulder[1];
+  ctx.fillRect(bx + PS * 2, by + PS * 4, PS * 2, PS);
+}
+
+function drawTemple(x, y) {
+  const tx = Math.round(x / PS) * PS;
+  ctx.fillStyle = PAL.temple[0];
+  ctx.fillRect(tx,      y - 52, 8,  52);
+  ctx.fillRect(tx + 24, y - 52, 8,  52);
+  ctx.fillRect(tx - 4,  y - 52, 40,  8);
+  ctx.fillRect(tx + 8,  y - 60, 16,  8);
+  ctx.fillRect(tx + 12, y - 64, 8,   4);
+  ctx.fillStyle = PAL.temple[1];
+  ctx.fillRect(tx + 6,  y - 52, 2, 52);
+  ctx.fillRect(tx + 24, y - 52, 2, 52);
+  ctx.fillStyle = PAL.temple[2];
+  ctx.fillRect(tx + 8,  y - 44, 16, 44);
+  // Golden glow from inside
+  ctx.fillStyle = 'rgba(255,180,20,0.25)';
+  ctx.fillRect(tx + 8, y - 44, 16, 44);
+}
+
+// ── Player ────────────────────────────────────────────────────────
+function drawPlayer() {
+  if (G.phase === 'dying' && (G.flash % 6) >= 3) return;
+  const p  = G.p;
+  const px = Math.round(p.x / PS) * PS;
+  const py = Math.round(p.y / PS) * PS;
+  const fi = !p.onGround ? 2 : Math.floor(p.x / 14) % 2;
+  drawSprite(fi, px, py);
+}
+
+// ── HUD ───────────────────────────────────────────────────────────
+function drawHUD() {
+  ctx.font      = '13px "Courier New", monospace';
+  ctx.textAlign = 'left';
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(10, 10, 138, 30);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fillText(`Lives lost: ${G.deaths}`, 20, 30);
+
+  if (G.p) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(W - 148, 10, 138, 30);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(`speed ${G.p.spd.toFixed(1)}x`, W - 20, 30);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ── Menu screen ───────────────────────────────────────────────────
+function drawMenu() {
+  ctx.textAlign = 'center';
+
+  ctx.font      = 'bold 58px "Courier New", monospace';
+  ctx.fillStyle = '#FFE860';
+  ctx.fillText('JUMPDLE', W / 2, H / 2 - 58);
+
+  ctx.font      = '14px "Courier New", monospace';
+  ctx.fillStyle = '#475569';
+  ctx.fillText(`Day #${G.day}`, W / 2, H / 2 - 20);
+
+  const isResume = G.lastCPIdx > 0 || G.deaths > 0;
+  ctx.font      = '21px "Courier New", monospace';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.fillText(isResume ? 'PRESS SPACE TO CONTINUE' : 'PRESS SPACE TO RUN', W / 2, H / 2 + 22);
+
+  ctx.font      = '13px "Courier New", monospace';
+  if (isResume) {
+    ctx.fillStyle = '#475569';
+    ctx.fillText(`${G.deaths} lives lost · checkpoint ${G.lastCPIdx}`, W / 2, H / 2 + 46);
+  } else {
+    ctx.fillStyle = '#2d3a4a';
+    ctx.fillText('reach the finish · as few lives lost as possible', W / 2, H / 2 + 58);
+    ctx.fillText('SPACE  =  jump', W / 2, H / 2 + 78);
+  }
+}
+
+// ── Dying overlay ─────────────────────────────────────────────────
+function drawDyingScreen() {
+  const t = Math.min(1, (22 - G.dyingTimer) / 12);
+  ctx.fillStyle = `rgba(4,6,12,${t * 0.75})`;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+
+  ctx.font      = `bold 40px "Courier New", monospace`;
+  ctx.fillStyle = `rgba(239,68,68,${t})`;
+  ctx.fillText('DEAD', W / 2, H / 2 - 16);
+
+  ctx.font      = '16px "Courier New", monospace';
+  ctx.fillStyle = `rgba(226,232,240,${t})`;
+  ctx.fillText(`Lives lost: ${G.deaths}`, W / 2, H / 2 + 16);
+
+  if (G.dyingTimer <= 0) {
+    ctx.font      = '15px "Courier New", monospace';
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillText('PRESS SPACE TO CONTINUE', W / 2, H / 2 + 50);
+  }
+}
+
+// ── End screen ────────────────────────────────────────────────────
+function drawEndScreen() {
+  if (G.endTimer < 22) return;
+  const t = Math.min(1, (G.endTimer - 22) / 22);
+
+  ctx.fillStyle = `rgba(4,6,12,${t * 0.88})`;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+
+  ctx.font      = `bold 40px "Courier New", monospace`;
+  ctx.fillStyle = `rgba(241,245,249,${t})`;
+  ctx.fillText('FINISHED!', W / 2, H / 2 - 78);
+
+  const label = G.deaths === 0 ? 'FLAWLESS RUN'
+              : G.deaths === 1 ? '1 LIFE LOST'
+              : `${G.deaths} LIVES LOST`;
+  const rgb   = G.deaths === 0 ? '74,222,128'
+              : G.deaths <= 2  ? '250,204,21'
+              : '226,232,240';
+
+  ctx.font      = `bold 26px "Courier New", monospace`;
+  ctx.fillStyle = `rgba(${rgb},${t})`;
+  ctx.fillText(label, W / 2, H / 2 - 34);
+
+  ctx.font      = '14px "Courier New", monospace';
+  ctx.fillStyle = `rgba(100,116,139,${t})`;
+  ctx.fillText(`Max speed: ${G.maxSpd.toFixed(1)}x  ·  Day #${G.day}`, W / 2, H / 2 + 8);
+
+  // Share button
+  if (t >= 0.9) {
+    ctx.fillStyle = '#1d4ed8';
+    roundRect(W / 2 - 100, H / 2 + 36, 200, 42, 7);
+    ctx.fill();
+    ctx.font      = '17px "Courier New", monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(G.copied > 0 ? '✓ Copied!' : 'Share Result', W / 2, H / 2 + 62);
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+// Share click
+canvas.addEventListener('click', e => {
+  if (G.phase !== 'end' || G.endTimer < 44) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx   = W / rect.width;
+  const sy   = H / rect.height;
+  const cx   = (e.clientX - rect.left) * sx;
+  const cy   = (e.clientY - rect.top)  * sy;
+  if (cx > W/2 - 100 && cx < W/2 + 100 && cy > H/2 + 36 && cy < H/2 + 78) {
+    const medal = G.deaths === 0 ? ' 🏆' : G.deaths <= 2 ? ' ⭐' : '';
+    const text  = `Jumpdle #${G.day}\nLives lost: ${G.deaths}${medal}\nMax speed: ${G.maxSpd.toFixed(1)}x`;
+    navigator.clipboard.writeText(text).catch(() => alert(text));
+    G.copied = 120;
+  }
+});
+
+// ── Game loop ─────────────────────────────────────────────────────
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+newGame();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
